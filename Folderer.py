@@ -1,12 +1,18 @@
-import os, json, sys, shutil
+import os, json, sys, shutil, re, webbrowser, threading
 from pathlib import Path
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog
 from tkinter.scrolledtext import ScrolledText
+import urllib.request, urllib.error
 
 
 class Folderer(tk.Tk):
     APP_VERSION = "v1.0.0"
+
+    # GitHub update source
+    GITHUB_OWNER = "iamMrBass"
+    GITHUB_REPO = "Folderer"
+
     SETTINGS_FILE = Path.home() / ".folderer_settings.json"
     THEMES = {
         "light":  dict(bg="#f3f4f6", text="#111827", muted="#6b7280", entry="#ffffff", btn="#ffffff", border="#d1d5db"),
@@ -27,7 +33,7 @@ class Folderer(tk.Tk):
         self.count = tk.StringVar(value="5")
         self.start = tk.StringVar(value="1")
         self.sep = tk.StringVar(value=" ")
-        self.pad = tk.StringVar(value="0")  # zero-pad WIDTH (0=no padding, 2=01, 3=001)
+        self.pad = tk.StringVar(value="0")  # zero-pad width (0=no padding, 2=01, 3=001)
 
         self.theme = tk.StringVar(value="Light")  # Light/Dark/Forest
         self.default_path = tk.StringVar(value=str(Path.cwd()))
@@ -38,9 +44,12 @@ class Folderer(tk.Tk):
 
         self.style = ttk.Style(self)
         self._after_preview = None
-        self._icon_img = None  # keep reference for iconphoto
+        self._icon_img = None
         self._c = self.THEMES["dark"]  # active theme colors
+
         self.gear_btn = self.back_btn = None
+        self.update_btn = None
+        self._update_checking = False
 
         self._load_settings()
         self._ui()
@@ -78,13 +87,81 @@ class Folderer(tk.Tk):
                 pass
 
         if not loaded:
-            messagebox.showwarning(
+            self._warn(
                 "Icon not loaded",
                 "Couldn’t load folderer.png or folderer.ico.\n\n"
                 f"Looked in:\n{self._resource_path('')}\n\n"
                 "Fix: put a valid 'folderer.png' (recommended) or 'folderer.ico' next to Folderer.py.\n"
                 "Also make sure Windows isn’t hiding extensions (so it’s not folderer.ico.png)."
             )
+
+    # ---------- themed popup helpers (replaces messagebox so popups match app theme) ----------
+    def _popup(self, title: str, message: str, kind="info", buttons=("OK",), default=0):
+        c = self._c
+        win = tk.Toplevel(self)
+        win.title(title)
+        win.transient(self)
+        win.resizable(False, False)
+        win.configure(bg=c["bg"])
+        win.grab_set()
+
+        outer = tk.Frame(win, bg=c["bg"], padx=16, pady=14)
+        outer.grid(sticky="nsew")
+        outer.columnconfigure(1, weight=1)
+
+        icon_map = {"info": "i", "warn": "!", "error": "✖", "question": "!"}
+        icon_text = icon_map.get(kind, "!")
+
+        icon = tk.Label(
+            outer, text=icon_text, bg=c["bg"], fg=c["text"],
+            font=("Segoe UI", 22, "bold"), width=2
+        )
+        icon.grid(row=0, column=0, sticky="n", padx=(0, 12))
+
+        msg = tk.Label(
+            outer, text=message, bg=c["bg"], fg=c["text"],
+            justify="left", wraplength=540, font=("Segoe UI", 10)
+        )
+        msg.grid(row=0, column=1, sticky="w")
+
+        res = {"i": None}
+        btns = tk.Frame(outer, bg=c["bg"])
+        btns.grid(row=1, column=1, sticky="e", pady=(16, 0))
+
+        def choose(i: int):
+            res["i"] = i
+            win.destroy()
+
+        for i, txt in enumerate(buttons):
+            b = ttk.Button(btns, text=txt, command=lambda k=i: choose(k))
+            b.grid(row=0, column=i, padx=(0, 10) if i < len(buttons) - 1 else (0, 0))
+            if i == default:
+                try:
+                    b.focus_set()
+                except Exception:
+                    pass
+
+        def on_escape():
+            # If there's a clear cancel option, choose last; else choose default
+            choose(len(buttons) - 1 if len(buttons) > 1 else default)
+
+        win.bind("<Escape>", lambda *_: on_escape())
+        win.bind("<Return>", lambda *_: choose(default))
+        win.protocol("WM_DELETE_WINDOW", on_escape)
+
+        win.update_idletasks()
+        w, h = win.winfo_width(), win.winfo_height()
+        x = self.winfo_rootx() + (self.winfo_width() // 2) - (w // 2)
+        y = self.winfo_rooty() + (self.winfo_height() // 2) - (h // 2)
+        win.geometry(f"+{max(0, x)}+{max(0, y)}")
+
+        win.wait_window()
+        return res["i"]
+
+    def _info(self, title, msg): self._popup(title, msg, kind="info", buttons=("OK",))
+    def _warn(self, title, msg): self._popup(title, msg, kind="warn", buttons=("OK",))
+    def _error(self, title, msg): self._popup(title, msg, kind="error", buttons=("OK",))
+    def _ask(self, title, msg): return self._popup(title, msg, kind="question", buttons=("Yes", "No"), default=0) == 0
 
     # ---------- UI ----------
     def _ui(self):
@@ -211,8 +288,12 @@ class Folderer(tk.Tk):
 
         right = ttk.Frame(bottom)
         right.grid(row=0, column=1, sticky="e")
-        ttk.Button(right, text="Reset warnings", command=self._reset_warnings).grid(row=0, column=0, padx=(0, 10))
-        ttk.Button(right, text="Save", command=self._save_and_back).grid(row=0, column=1)
+
+        self.update_btn = ttk.Button(right, text="Check updates", command=self._check_updates)
+        self.update_btn.grid(row=0, column=0, padx=(0, 10))
+
+        ttk.Button(right, text="Reset warnings", command=self._reset_warnings).grid(row=0, column=1, padx=(0, 10))
+        ttk.Button(right, text="Save", command=self._save_and_back).grid(row=0, column=2)
 
     # ---------- Events ----------
     def _wire_events(self):
@@ -227,43 +308,42 @@ class Folderer(tk.Tk):
         if flag_name and not getattr(self, flag_name, True):
             return True
 
+        c = self._c
         win = tk.Toplevel(self)
         win.title(title)
         win.transient(self)
         win.resizable(False, False)
-        win.configure(bg=self._c["bg"])
+        win.configure(bg=c["bg"])
         win.grab_set()
 
-        outer = tk.Frame(win, bg=self._c["bg"], padx=16, pady=14)
+        outer = tk.Frame(win, bg=c["bg"], padx=16, pady=14)
         outer.grid(sticky="nsew")
         outer.columnconfigure(1, weight=1)
 
-        # High-contrast icon for dark/forest too
         icon = tk.Label(
-            outer, text=icon_text, bg=self._c["bg"], fg=self._c["text"],
+            outer, text=icon_text, bg=c["bg"], fg=c["text"],
             font=("Segoe UI", 22, "bold"), width=2
         )
         icon.grid(row=0, column=0, rowspan=3, sticky="n", padx=(0, 12), pady=(0, 0))
 
         msg = tk.Label(
-            outer, text=message, bg=self._c["bg"], fg=self._c["text"],
+            outer, text=message, bg=c["bg"], fg=c["text"],
             justify="left", wraplength=520, font=("Segoe UI", 10)
         )
         msg.grid(row=0, column=1, sticky="w")
 
         dont = tk.BooleanVar(value=False)
-        cb = None
         if flag_name:
             cb = tk.Checkbutton(
                 outer, text="Don't show again", variable=dont,
-                bg=self._c["bg"], fg=self._c["text"], activebackground=self._c["bg"],
-                activeforeground=self._c["text"], selectcolor=self._c["entry"],
+                bg=c["bg"], fg=c["text"], activebackground=c["bg"],
+                activeforeground=c["text"], selectcolor=c["entry"],
                 highlightthickness=0
             )
             cb.grid(row=1, column=1, sticky="w", pady=(12, 0))
 
         res = {"ok": False}
-        btns = tk.Frame(outer, bg=self._c["bg"])
+        btns = tk.Frame(outer, bg=c["bg"])
         btns.grid(row=2, column=1, sticky="e", pady=(16, 0))
 
         def close(ok: bool):
@@ -295,7 +375,91 @@ class Folderer(tk.Tk):
         self.warn_folder_files_confirm = True
         self.warn_create_many = True
         self._save_settings()
-        messagebox.showinfo("Warnings reset", "All warnings have been re-enabled.")
+        self._info("Warnings reset", "All warnings have been re-enabled.")
+
+    # ---------- Update checker ----------
+    @staticmethod
+    def _vtuple(v: str):
+        s = re.sub(r"^[^\d]*", "", (v or "").strip())
+        parts = []
+        for x in s.split("."):
+            if x.isdigit():
+                parts.append(int(x))
+        parts += [0, 0, 0]
+        return tuple(parts[:3])
+
+    def _gh_latest_api(self):
+        return f"https://api.github.com/repos/{self.GITHUB_OWNER}/{self.GITHUB_REPO}/releases/latest"
+
+    @staticmethod
+    def _pick_exe_asset_url(assets, ver_clean: str):
+        preferred = [
+            f"folderer_v{ver_clean}.exe",
+            f"folderer_{ver_clean}.exe",
+            "folderer.exe",
+        ]
+        by_name = {((a.get("name") or "").strip().lower()): a for a in (assets or [])}
+        for name in preferred:
+            a = by_name.get(name)
+            if a and a.get("browser_download_url"):
+                return (a.get("browser_download_url") or "").strip()
+
+        for a in (assets or []):
+            n = (a.get("name") or "").strip().lower()
+            if n.startswith("folderer") and n.endswith(".exe") and a.get("browser_download_url"):
+                return (a.get("browser_download_url") or "").strip()
+
+        return ""
+
+    def _check_updates(self):
+        if self._update_checking:
+            return
+
+        self._update_checking = True
+        if self.update_btn:
+            self.update_btn.configure(text="Checking...", state="disabled")
+
+        def worker():
+            try:
+                req = urllib.request.Request(
+                    self._gh_latest_api(),
+                    headers={"User-Agent": f"Folderer/{self.APP_VERSION}", "Accept": "application/vnd.github+json"}
+                )
+                with urllib.request.urlopen(req, timeout=7) as r:
+                    data = json.loads(r.read().decode("utf-8"))
+
+                tag = (data.get("tag_name") or "").strip()   # e.g. v1.0.0
+                html_url = (data.get("html_url") or "").strip()
+                ver_clean = tag.lstrip("vV")
+                dl_url = self._pick_exe_asset_url(data.get("assets") or [], ver_clean)
+
+                cur = self._vtuple(self.APP_VERSION)
+                lat = self._vtuple(tag)
+                update = bool(tag) and lat > cur
+
+                self.after(0, lambda: self._finish_update_check(update, tag or "unknown", dl_url, html_url))
+            except urllib.error.HTTPError as e:
+                self.after(0, lambda: self._finish_update_check(False, "unknown", "", "", err=f"HTTP error: {e.code}"))
+            except Exception as e:
+                self.after(0, lambda: self._finish_update_check(False, "unknown", "", "", err=str(e)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_update_check(self, update_available, latest_tag, download_url, release_page, err=""):
+        self._update_checking = False
+        if self.update_btn:
+            self.update_btn.configure(text="Check updates", state="normal")
+
+        if err:
+            return self._error("Update check failed", f"Couldn’t check for updates.\n\n{err}")
+
+        if update_available:
+            msg = f"Update available!\n\nCurrent: {self.APP_VERSION}\nLatest:  {latest_tag}\n\nOpen download?"
+            if self._ask("Update available", msg):
+                webbrowser.open(download_url or release_page)
+            return
+
+        self._info("Up to date", f"You're up to date.\n\nCurrent: {self.APP_VERSION}\nLatest:  {latest_tag}")
 
     # ---------- Helpers ----------
     def _schedule_preview(self):
@@ -373,9 +537,9 @@ class Folderer(tk.Tk):
         try:
             target = Path(self.path.get()).expanduser().resolve()
         except Exception:
-            return messagebox.showerror("Bad path", "That path doesn't look valid.")
+            return self._error("Bad path", "That path doesn't look valid.")
         if not target.exists():
-            return messagebox.showerror("Path not found", f"This path doesn't exist:\n{target}")
+            return self._error("Path not found", f"This path doesn't exist:\n{target}")
 
         msg = (
             "This will move every file in the selected folder into its own\n"
@@ -400,7 +564,7 @@ class Folderer(tk.Tk):
                 errors += 1
                 self._set_log(f"❌ Error: {p.name} -> {e}\n", append=True)
 
-        messagebox.showinfo("Done", f"Moved: {moved}\nErrors: {errors}\n\nTarget:\n{target}")
+        self._info("Done", f"Moved: {moved}\nErrors: {errors}\n\nTarget:\n{target}")
 
     # ---------- Theme ----------
     def _apply_theme(self):
@@ -490,28 +654,29 @@ class Folderer(tk.Tk):
     def _open_target(self):
         try:
             p = Path(self.path.get()).expanduser().resolve()
-            if not p.exists(): return messagebox.showerror("Path not found", f"This path doesn't exist:\n{p}")
+            if not p.exists():
+                return self._error("Path not found", f"This path doesn't exist:\n{p}")
             os.startfile(str(p))
         except Exception as e:
-            messagebox.showerror("Error", str(e))
+            self._error("Error", str(e))
 
     def _create(self):
         base = (self.base.get() or "").strip()
         if not base:
-            return messagebox.showerror("Missing name", "Folder base name can't be empty.")
+            return self._error("Missing name", "Folder base name can't be empty.")
         try:
             target = Path(self.path.get()).expanduser().resolve()
         except Exception:
-            return messagebox.showerror("Bad path", "That path doesn't look valid.")
+            return self._error("Bad path", "That path doesn't look valid.")
 
         if not target.exists():
-            if not messagebox.askyesno("Create path?", f"This folder doesn't exist:\n{target}\n\nCreate it?"):
+            if not self._ask("Create path?", f"This folder doesn't exist:\n{target}\n\nCreate it?"):
                 return
             try:
                 target.mkdir(parents=True, exist_ok=True)
                 self._set_log(f"Created target path: {target}\n", append=True)
             except Exception as e:
-                return messagebox.showerror("Error creating path", str(e))
+                return self._error("Error creating path", str(e))
 
         if self.numbered.get():
             count = self._clamp(self._int(self.count.get(), 1), 1, 9999)
@@ -545,7 +710,7 @@ class Folderer(tk.Tk):
             except Exception as e:
                 self._set_log(f"❌ Error: {p} -> {e}\n", append=True)
 
-        messagebox.showinfo("Done", f"Created: {made}\nSkipped: {skipped}\n\nPath:\n{target}")
+        self._info("Done", f"Created: {made}\nSkipped: {skipped}\n\nPath:\n{target}")
 
 
 if __name__ == "__main__":
